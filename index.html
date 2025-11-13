@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>3D Audio Visualizer — Bird Frequency Edition</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      overflow: hidden;
+      font-family: system-ui, sans-serif;
+    }
+    #btn {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      padding: 8px 14px;
+      font-size: 13px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      z-index: 10;
+    }
+    #info {
+      position: fixed;
+      bottom: 12px;
+      left: 16px;
+      color: #fff;
+      font-size: 11px;
+      opacity: 0.6;
+      z-index: 5;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <button id="btn">PLAY / PAUSE</button>
+
+  <div id="info">
+    특정 주파수(2–12 kHz)에서만 점이 생성되는 것을 우선 시합니다.<br>
+    같은 순간에 주파수가 높을수록 점이 더 크게, 낮을수록 더 작게 나타나며,<br>
+    점 크기에 따라 색상이 Cyan → Purple → Orange → Red로 변합니다.<br>
+    마우스로 드래그하여 카메라를 자유롭게 회전하고, 휠로 줌 인/아웃 할 수 있습니다.
+  </div>
+
+  <canvas id="c"></canvas>
+
+  <!-- Three.js core -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- OrbitControls -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/controls/OrbitControls.min.js"></script>
+
+  <script>
+    (function () {
+      // ===== AUDIO SETUP =====
+      const soundList = [
+        "sound/American Goldfinch.mp3",
+        "sound/Botaurus Lentiginosus.mp3",
+        "sound/Colibri.mp3",
+        "sound/Poecile atricapillus.mp3",
+        "sound/Toxostoma Rufum.mp3"
+      ];
+
+      function pickRandomSound() {
+        const i = Math.floor(Math.random() * soundList.length);
+        return soundList[i];
+      }
+
+      const audio = new Audio();
+      audio.src = pickRandomSound();
+      audio.loop = true;
+      audio.crossOrigin = "anonymous";
+
+      let audioCtx, source, analyser, dataArray;
+      let audioInitialized = false;
+
+      const btn = document.getElementById("btn");
+      btn.onclick = async () => {
+        if (!audioInitialized) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          source = audioCtx.createMediaElementSource(audio);
+          analyser = new AnalyserNode(audioCtx, { fftSize: 1024 });
+          dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+          source.connect(analyser);
+          analyser.connect(audioCtx.destination);
+
+          audioInitialized = true;
+        } else if (audio.paused) {
+          // mỗi lần play lại từ trạng thái pause → random bài mới
+          audio.src = pickRandomSound();
+        }
+
+        if (audioCtx.state === "suspended") await audioCtx.resume();
+
+        if (audio.paused) audio.play();
+        else audio.pause();
+      };
+
+      // ===== THREE.JS SETUP =====
+      const canvas = document.getElementById("c");
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 0, 120);
+
+      // OrbitControls
+      let controls = null;
+      let userInteracting = false;
+
+      if (THREE.OrbitControls) {
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.enablePan = true;
+        controls.rotateSpeed = 0.9;
+        controls.zoomSpeed = 1.4;
+        controls.minDistance = 30;
+        controls.maxDistance = 300;
+      }
+
+      // Mouse hold → đánh dấu đang điều khiển
+      renderer.domElement.addEventListener("mousedown", () => {
+        userInteracting = true;
+      });
+      window.addEventListener("mouseup", () => {
+        userInteracting = false;
+      });
+
+      // Touch (mobile) cũng tính là điều khiển
+      renderer.domElement.addEventListener("touchstart", () => {
+        userInteracting = true;
+      });
+      window.addEventListener("touchend", () => {
+        userInteracting = false;
+      });
+
+      window.addEventListener("resize", () => {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      });
+
+      const group = new THREE.Group();
+      scene.add(group);
+      // scale lên một chút cho dễ thấy
+      group.scale.set(1.6, 1.6, 1.6);
+
+      // ===== TRAIL DATA =====
+      const MAX_POINTS = 2500;
+      const LEVEL_THRESHOLD = 0.01;   // nhạy hơn
+      const SOFT_LIMIT = 90;
+
+      let pointsArray = [];
+      let colorsArray = [];
+      let linePointsArray = [];
+
+      let lastPoint = new THREE.Vector3(0, 0, 0);
+
+      // ===== GEOMETRY =====
+      const pointsGeometry = new THREE.BufferGeometry();
+      const pointsMaterial = new THREE.PointsMaterial({
+        size: 4,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95
+      });
+      const points = new THREE.Points(pointsGeometry, pointsMaterial);
+      group.add(points);
+
+      const linesGeometry = new THREE.BufferGeometry();
+      const linesMaterial = new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.35
+      });
+      const lines = new THREE.LineSegments(linesGeometry, linesMaterial);
+      group.add(lines);
+
+      function updatePointsGeometry() {
+        if (pointsArray.length === 0) return;
+        pointsGeometry.setFromPoints(pointsArray);
+        pointsGeometry.setAttribute(
+          "color",
+          new THREE.Float32BufferAttribute(colorsArray, 3)
+        );
+      }
+
+      function updateLinesGeometry() {
+        if (linePointsArray.length < 2) return;
+        linesGeometry.setFromPoints(linePointsArray);
+      }
+
+      // ===== Bird-frequency detection (2–12 kHz) =====
+      function getBirdFrequency(dataArray, sampleRate, fftSize) {
+        let peakIndex = -1;
+        let peakValue = 0;
+        const hzPerBin = sampleRate / fftSize;
+
+        for (let i = 0; i < dataArray.length; i++) {
+          const freq = i * hzPerBin;
+          if (freq < 2000 || freq > 12000) continue;
+
+          const v = dataArray[i];
+          if (v > peakValue) {
+            peakValue = v;
+            peakIndex = i;
+          }
+        }
+
+        if (peakIndex === -1) return null;
+        return peakIndex * hzPerBin;
+      }
+
+      // ===== freq → size =====
+      function freqToSize(freq) {
+        if (!freq || freq < 2000 || freq > 12000) return 3.0;
+
+        const minF = 2000;
+        const maxF = 12000;
+        const t = (freq - minF) / (maxF - minF); // 0 → 1
+
+        const minSize = 3.0;
+        const maxSize = 10.0;
+        return minSize + t * (maxSize - minSize);
+      }
+
+      // ===== size → color =====
+      function sizeToColor(size) {
+        const c = new THREE.Color();
+
+        if (size < 4) {
+          c.set("#55ccff");      // cyan
+        } else if (size < 6) {
+          c.set("#aa66ff");      // purple
+        } else if (size < 8) {
+          c.set("#ff9944");      // orange
+        } else {
+          c.set("#ff5555");      // red
+        }
+        return c;
+      }
+
+      // ===== RANDOM WALK SPAWN =====
+      function spawnPoint(level) {
+        if (!audioInitialized) return;
+
+        let freq = getBirdFrequency(dataArray, audioCtx.sampleRate, analyser.fftSize);
+        // nếu không bắt được freq rõ → vẫn spawn chấm rất nhỏ, coi như thấp
+        if (!freq) freq = 2200;
+
+        const size = freqToSize(freq);
+        pointsMaterial.size = size;
+
+        const col = sizeToColor(size);
+
+        const stepSize = 1.5 + size * 0.7;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+
+        const dx = Math.sin(phi) * Math.cos(theta) * stepSize;
+        const dy = Math.sin(phi) * Math.sin(theta) * stepSize;
+        const dz = Math.cos(phi) * stepSize;
+
+        let newPoint = lastPoint.clone().add(new THREE.Vector3(dx, dy, dz));
+
+        if (newPoint.length() > SOFT_LIMIT) {
+          newPoint.multiplyScalar(SOFT_LIMIT / newPoint.length() * 0.97 + 0.03);
+        }
+
+        pointsArray.push(newPoint);
+        colorsArray.push(col.r, col.g, col.b);
+
+        if (pointsArray.length > 1) {
+          const prev = pointsArray[pointsArray.length - 2];
+          linePointsArray.push(prev.clone(), newPoint.clone());
+        }
+
+        if (pointsArray.length > MAX_POINTS) {
+          pointsArray.shift();
+          colorsArray.splice(0, 3);
+          if (linePointsArray.length > 2) {
+            linePointsArray.splice(0, 2);
+          }
+        }
+
+        lastPoint = newPoint;
+        updatePointsGeometry();
+        updateLinesGeometry();
+      }
+
+      // ===== ANIMATION LOOP =====
+      function animate() {
+        requestAnimationFrame(animate);
+
+        if (audioInitialized) {
+          analyser.getByteFrequencyData(dataArray);
+
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+          const level = sum / (dataArray.length * 255);
+
+          if (level > LEVEL_THRESHOLD) {
+            spawnPoint(level);
+          }
+
+          let bass = 0;
+          const bassBins = Math.min(30, dataArray.length);
+          for (let i = 0; i < bassBins; i++) bass += dataArray[i];
+          bass = bass / (bassBins * 255);
+
+          // chỉ auto xoay khi người dùng không nhấn giữ chuột
+          if (!userInteracting) {
+            group.rotation.x += 0.0007 + bass * 0.003;
+            group.rotation.y += 0.0010 + bass * 0.004;
+          }
+        }
+
+        if (controls) controls.update();
+
+        renderer.render(scene, camera);
+      }
+
+      animate();
+    })();
+  </script>
+</body>
+</html>
